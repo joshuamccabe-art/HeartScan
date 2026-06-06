@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#030712" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="HeartScan" />
+  <title>HeartScan</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap');
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { background: #030712; min-height: 100vh; -webkit-tap-highlight-color: transparent; }
+    @keyframes fadeUp { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes spin   { to { transform: rotate(360deg); } }
+    .mode-btn  { transition: all 0.2s; cursor: pointer; border: none; }
+    .mode-btn:hover { opacity: 0.85; }
+    .scan-btn  { transition: all 0.2s; cursor: pointer; border: none; }
+    .scan-btn:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.1); }
+    .scan-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    input { outline: none; -webkit-appearance: none; }
+    input:focus { border-color: #e11d48 !important; }
+    .drop-zone { transition: border-color 0.2s; }
+    .drop-zone:hover { border-color: #e11d48 !important; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+<script type="text/babel">
+const { useState, useRef, useCallback } = React;
+const STORAGE_KEY = 'heartscan_api_key';
+
+const SYSTEM_PROMPT = `You are a clinical dietitian and food safety expert specialized in cardiovascular nutrition and food additive safety.
+The user has low HDL and elevated LDL cholesterol. Their doctor has also advised limiting refined carbohydrates.
+
+CARDIOVASCULAR PROFILE - AVOID:
+- Saturated fat over 3g per serving
+- Any trans fats (partially hydrogenated oils)
+- Added sugars over 6g per serving
+- Coconut oil, palm oil, palm kernel oil
+- Processed meats (salami, pepperoni, hot dogs, bologna, sausage, bacon, ham, deli meats, prosciutto, chorizo)
+- Refined/simple carbs: white flour, white rice, refined starch, corn syrup, maltodextrin, dextrose as primary ingredients
+- High net carbs per serving (flag if over 30g net carbs)
+
+CARDIOVASCULAR PROFILE - SEEK:
+- Soluble fiber (oat fiber, beta-glucan, psyllium, chia, flaxseed)
+- Olive oil or avocado oil as primary fat
+- Omega-3 fatty acids
+- Whole food carb sources
+
+ADDITIVE SAFETY - FLAG THESE:
+- Artificial colors: Red 40, Yellow 5, Yellow 6, Blue 1, Blue 2, Red 3, Green 3, caramel color (Class III/IV)
+- Preservatives: sodium nitrite, sodium nitrate, BHA, BHT, TBHQ, sodium benzoate, potassium bromate
+- Emulsifiers: carrageenan, polysorbate 80, polysorbate 60, carboxymethylcellulose (CMC)
+- Artificial sweeteners: aspartame, sucralose, acesulfame-K, saccharin, neotame
+- Flavor enhancers: MSG, autolyzed yeast extract, disodium inosinate, disodium guanylate
+- Solvents: propylene glycol, BVO (brominated vegetable oil)
+
+For each flagged additive, provide a plain-language explanation (1 sentence, under 15 words).
+
+ADDITIVE GRADE: "Clean" = 0 additives, "Moderate" = 1-2 minor, "Concerning" = 3+ or any high-risk (nitrites, BHA/BHT/TBHQ, artificial colors)
+
+Return ONLY valid JSON, no markdown, no backticks, no preamble:
+{
+  "productName": "Full product name",
+  "brand": "Brand or empty string",
+  "score": <1-10>,
+  "verdict": "Buy It" | "Limit It" | "Skip It",
+  "additiveGrade": "Clean" | "Moderate" | "Concerning",
+  "reasons": ["reason 1", "reason 2", "reason 3"],
+  "flaggedIngredients": ["ingredient1"],
+  "flaggedAdditives": [{ "name": "name", "category": "category", "why": "plain-language concern" }],
+  "goodIngredients": ["ingredient1"],
+  "nutritionHighlights": {
+    "saturatedFat": "<n>g or unknown",
+    "transFat": "<n>g or unknown",
+    "fiber": "<n>g or unknown",
+    "netCarbs": "<n>g or unknown",
+    "addedSugars": "<n>g or unknown"
+  },
+  "summary": "One sentence 15 words or less."
+}
+Score: 1-3=Skip It, 4-6=Limit It, 7-10=Buy It. Penalize sat fat, trans fat, processed meat, refined carbs, concerning additives.`;
+
+const ALTERNATIVES_PROMPT = `You are a clinical dietitian. User has low HDL, elevated LDL, needs to limit refined carbs.
+Generate 5 specific real purchasable alternative products: better cardiovascular profile, cleaner additives, same food category, available at US grocery stores (Whole Foods, Target, Costco, Kroger).
+Give specific brand + product names only (no generic descriptions).
+Return ONLY valid JSON:
+{
+  "alternatives": [{
+    "productName": "Brand + Product Name",
+    "brand": "Brand",
+    "heartScore": <1-10>,
+    "additiveGrade": "Clean" | "Moderate" | "Concerning",
+    "whyBetter": "One sentence max 15 words",
+    "keyBenefit": "single best feature"
+  }]
+}`;
+
+async function callAPI(messages, systemPrompt, apiKey) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1500,
+      system: systemPrompt,
+      messages,
+      tools: [{ type: "web_search_20250305", name: "web_search" }]
+    })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `API error ${res.status}`);
+  }
+  const data = await res.json();
+  const text = data.content?.find(b => b.type === "text")?.text;
+  if (!text) throw new Error("No response from AI");
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error("Could not parse response. Try rephrasing your search.");
+  return JSON.parse(match[0]);
+}
+
+async function analyzeFood(input, mode, apiKey) {
+  let content;
+  if (mode === "photo") {
+    content = [
+      { type: "image", source: { type: "base64", media_type: input.mediaType, data: input.base64 } },
+      { type: "text", text: "Analyze this nutrition label for cardiovascular health and additive safety. Return only the JSON." }
+    ];
+  } else if (mode === "upc") {
+    content = `UPC: ${input}. Use web search to identify this product then analyze for cardiovascular health and additive safety. If unverified add "(unverified)" to productName. Always return JSON only.`;
+  } else {
+    content = `Product: "${input}". Analyze for cardiovascular health and additive safety. Return only the JSON.`;
+  }
+  return callAPI([{ role: "user", content }], SYSTEM_PROMPT, apiKey);
+}
+
+async function fetchAlternatives(productName, brand, apiKey) {
+  const content = `Scanned product: "${brand ? brand + ' ' : ''}${productName}". Find 5 better alternatives in the same category. Return only the JSON.`;
+  return callAPI([{ role: "user", content }], ALTERNATIVES_PROMPT, apiKey);
+}
+
+const VC = {
+  "Buy It":  { color: "#22c55e", bg: "#052e16", icon: "✓", glow: "0 0 20px rgba(34,197,94,0.4)" },
+  "Limit It":{ color: "#f59e0b", bg: "#1c1108", icon: "~", glow: "0 0 20px rgba(245,158,11,0.4)" },
+  "Skip It": { color: "#ef4444", bg: "#1c0505", icon: "✕", glow: "0 0 20px rgba(239,68,68,0.4)" }
+};
+const AC = {
+  "Clean":      { color: "#22c55e", bg: "#052e16", icon: "✦" },
+  "Moderate":   { color: "#f59e0b", bg: "#1c1108", icon: "◈" },
+  "Concerning": { color: "#ef4444", bg: "#1c0505", icon: "⚠" }
+};
+
+function ScoreRing({ score, size = 96 }) {
+  const small = size < 70;
+  const r = small ? 20 : 36;
+  const sw = small ? 5 : 8;
+  const circ = 2 * Math.PI * r;
+  const offset = circ - (score / 10) * circ;
+  const color = score >= 7 ? "#22c55e" : score >= 4 ? "#f59e0b" : "#ef4444";
+  return (
+    <div style={{ position: "relative", width: size, height: size, flexShrink: 0 }}>
+      <svg width={size} height={size} style={{ transform: "rotate(-90deg)" }}>
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="#1e293b" strokeWidth={sw} />
+        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={sw}
+          strokeDasharray={circ} strokeDashoffset={offset} strokeLinecap="round"
+          style={{ transition: "stroke-dashoffset 0.8s ease", filter: `drop-shadow(0 0 4px ${color})` }} />
+      </svg>
+      <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ fontSize: small ? 15 : 26, fontWeight: 800, color, fontFamily: "monospace", lineHeight: 1 }}>{score}</span>
+        {!small && <span style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.15em", fontFamily: "monospace" }}>/10</span>}
+      </div>
+    </div>
+  );
+}
+
+function AltCard({ alt }) {
+  const ac = AC[alt.additiveGrade] || AC["Moderate"];
+  return (
+    <div style={{ background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: 14, animation: "fadeUp 0.3s ease" }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+        <ScoreRing score={alt.heartScore} size={56} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 10, color: "#475569", fontFamily: "monospace", marginBottom: 2 }}>{alt.brand}</div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#f1f5f9", lineHeight: 1.3 }}>{alt.productName}</div>
+          <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+            <span style={{ background: ac.bg, border: `1px solid ${ac.color}44`, color: ac.color, borderRadius: 4, padding: "2px 7px", fontSize: 10, fontFamily: "monospace" }}>{ac.icon} {alt.additiveGrade}</span>
+            <span style={{ background: "#0f172a", border: "1px solid #22c55e33", color: "#86efac", borderRadius: 4, padding: "2px 7px", fontSize: 10, fontFamily: "monospace" }}>{alt.keyBenefit}</span>
+          </div>
+        </div>
+      </div>
+      <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8", lineHeight: 1.5, borderTop: "1px solid #1e293b", paddingTop: 10 }}>{alt.whyBetter}</div>
+    </div>
+  );
+}
+
+function ResultCard({ result, apiKey }) {
+  const vc = VC[result.verdict] || VC["Limit It"];
+  const ac = AC[result.additiveGrade] || AC["Moderate"];
+  const [altsOpen, setAltsOpen] = useState(false);
+  const [alts, setAlts] = useState(null);
+  const [altsLoading, setAltsLoading] = useState(false);
+  const [altsError, setAltsError] = useState(null);
+
+  const loadAlts = async () => {
+    if (alts) { setAltsOpen(true); return; }
+    setAltsOpen(true); setAltsLoading(true); setAltsError(null);
+    try {
+      const data = await fetchAlternatives(result.productName, result.brand, apiKey);
+      setAlts(data.alternatives);
+    } catch(e) { setAltsError(e.message); }
+    finally { setAltsLoading(false); }
+  };
+
+  const Chip = ({ children, color, bg, border }) => (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 6, background: bg, border: `1px solid ${border}`, color, borderRadius: 20, padding: "4px 12px", fontSize: 12, fontWeight: 700, fontFamily: "monospace" }}>{children}</span>
+  );
+
+  return (
+    <div style={{ background: "#0f172a", borderRadius: 16, border: `1px solid ${vc.color}33`, boxShadow: vc.glow, overflow: "hidden", animation: "fadeUp 0.4s ease" }}>
+
+      {/* Header */}
+      <div style={{ padding: "20px 20px 16px", borderBottom: "1px solid #1e293b" }}>
+        <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
+          <ScoreRing score={result.score} />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 11, color: "#64748b", letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "monospace", marginBottom: 4 }}>{result.brand || "Product"}</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: "#f1f5f9", lineHeight: 1.3 }}>{result.productName}</div>
+            <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+              <Chip color={vc.color} bg={vc.bg} border={vc.color + "55"}>{vc.icon} {result.verdict}</Chip>
+              <Chip color={ac.color} bg={ac.bg} border={ac.color + "55"}>{ac.icon} {result.additiveGrade}</Chip>
+            </div>
+          </div>
+        </div>
+        <div style={{ marginTop: 12, fontSize: 13, color: "#94a3b8", fontStyle: "italic", lineHeight: 1.5 }}>{result.summary}</div>
+      </div>
+
+      {/* Nutrition */}
+      {result.nutritionHighlights && (
+        <div style={{ borderBottom: "1px solid #1e293b" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", borderBottom: "1px solid #0f172a" }}>
+            {[["Sat Fat", result.nutritionHighlights.saturatedFat, false], ["Trans Fat", result.nutritionHighlights.transFat, false], ["Fiber", result.nutritionHighlights.fiber, true]].map(([l, v, good]) => (
+              <div key={l} style={{ padding: "10px 8px", textAlign: "center", borderRight: "1px solid #1e293b" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: good ? "#86efac" : "#e2e8f0", fontFamily: "monospace" }}>{v || "—"}</div>
+                <div style={{ fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em", marginTop: 2 }}>{l}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr" }}>
+            {[["Net Carbs", result.nutritionHighlights.netCarbs], ["Added Sugar", result.nutritionHighlights.addedSugars]].map(([l, v]) => (
+              <div key={l} style={{ padding: "10px 8px", textAlign: "center", borderRight: "1px solid #1e293b" }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: "#fde68a", fontFamily: "monospace" }}>{v || "—"}</div>
+                <div style={{ fontSize: 9, color: "#475569", textTransform: "uppercase", letterSpacing: "0.1em", marginTop: 2 }}>{l}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Additive flags */}
+      {result.flaggedAdditives?.length > 0 && (
+        <div style={{ padding: "14px 20px", borderBottom: "1px solid #1e293b" }}>
+          <div style={{ fontSize: 10, color: "#f59e0b", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 10, fontFamily: "monospace" }}>◈ Additive Flags</div>
+          {result.flaggedAdditives.map((a, i) => (
+            <div key={i} style={{ marginBottom: 8, padding: "10px 12px", background: "#0f0a00", border: "1px solid #f59e0b22", borderRadius: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#fbbf24", fontFamily: "monospace" }}>{a.name}</span>
+                <span style={{ fontSize: 9, color: "#78716c", background: "#1c1108", borderRadius: 3, padding: "1px 5px", fontFamily: "monospace", textTransform: "uppercase" }}>{a.category}</span>
+              </div>
+              <div style={{ fontSize: 12, color: "#a8a29e", lineHeight: 1.5 }}>{a.why}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Flagged ingredients */}
+      {result.flaggedIngredients?.length > 0 && (
+        <div style={{ padding: "12px 20px", borderBottom: "1px solid #1e293b" }}>
+          <div style={{ fontSize: 10, color: "#ef4444", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 8, fontFamily: "monospace" }}>⚠ Flagged Ingredients</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {result.flaggedIngredients.map(ing => (
+              <span key={ing} style={{ background: "#1c0505", border: "1px solid #ef444466", color: "#f87171", borderRadius: 4, padding: "3px 8px", fontSize: 11, fontFamily: "monospace" }}>{ing}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Good ingredients */}
+      {result.goodIngredients?.length > 0 && (
+        <div style={{ padding: "12px 20px", borderBottom: "1px solid #1e293b" }}>
+          <div style={{ fontSize: 10, color: "#22c55e", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 8, fontFamily: "monospace" }}>♥ Heart-Friendly</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {result.goodIngredients.map(ing => (
+              <span key={ing} style={{ background: "#052e16", border: "1px solid #22c55e66", color: "#86efac", borderRadius: 4, padding: "3px 8px", fontSize: 11, fontFamily: "monospace" }}>{ing}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Reasons */}
+      <div style={{ padding: "14px 20px", borderBottom: "1px solid #1e293b" }}>
+        <div style={{ fontSize: 10, color: "#64748b", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 10, fontFamily: "monospace" }}>Analysis</div>
+        {result.reasons?.map((r, i) => (
+          <div key={i} style={{ display: "flex", gap: 10, marginBottom: 8, alignItems: "flex-start" }}>
+            <span style={{ color: "#334155", fontSize: 14, marginTop: 1, flexShrink: 0 }}>›</span>
+            <span style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.5 }}>{r}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* Better options */}
+      <div style={{ padding: "14px 20px" }}>
+        <button onClick={altsOpen ? () => setAltsOpen(false) : loadAlts} style={{
+          width: "100%", padding: 12, borderRadius: 10, cursor: "pointer",
+          background: altsOpen ? "#0a0f1a" : "linear-gradient(135deg, #1d4ed8, #1e3a8a)",
+          border: altsOpen ? "1px solid #1e293b" : "1px solid #3b82f633",
+          color: altsOpen ? "#64748b" : "#93c5fd",
+          fontSize: 12, fontWeight: 700, fontFamily: "monospace", letterSpacing: "0.1em", textTransform: "uppercase",
+          boxShadow: altsOpen ? "none" : "0 0 16px rgba(59,130,246,0.2)", transition: "all 0.2s"
+        }}>
+          {altsOpen ? "▲ Hide Alternatives" : "⊕ Find Better Options"}
+        </button>
+        {altsOpen && (
+          <div style={{ marginTop: 14 }}>
+            {altsLoading && (
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "24px 0", color: "#475569", fontSize: 12, fontFamily: "monospace" }}>
+                <span style={{ width: 14, height: 14, border: "2px solid #1e293b", borderTopColor: "#3b82f6", borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }} />
+                Finding better options...
+              </div>
+            )}
+            {altsError && <div style={{ padding: 12, background: "#1c0505", border: "1px solid #ef444433", borderRadius: 8, color: "#f87171", fontSize: 12, fontFamily: "monospace" }}>⚠ {altsError}</div>}
+            {alts && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ fontSize: 10, color: "#3b82f6", letterSpacing: "0.12em", textTransform: "uppercase", fontFamily: "monospace", marginBottom: 2 }}>Better Alternatives</div>
+                {alts.map((alt, i) => <AltCard key={i} alt={alt} />)}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ApiKeyScreen({ onSave }) {
+  const [key, setKey] = useState('');
+  const [show, setShow] = useState(false);
+  const valid = key.startsWith('sk-');
+  return (
+    <div style={{ minHeight: "100vh", background: "#030712", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "32px 24px" }}>
+      <div style={{ textAlign: "center", marginBottom: 36 }}>
+        <div style={{ fontSize: 56, marginBottom: 12, filter: "drop-shadow(0 0 20px #e11d48)" }}>♥</div>
+        <div style={{ fontSize: 28, fontWeight: 800, color: "#f1f5f9", letterSpacing: "-0.03em" }}>Heart<span style={{ color: "#e11d48" }}>Scan</span></div>
+        <div style={{ fontSize: 11, color: "#475569", letterSpacing: "0.14em", textTransform: "uppercase", fontFamily: "monospace", marginTop: 6 }}>Heart Health + Additive Safety</div>
+      </div>
+      <div style={{ width: "100%", maxWidth: 360 }}>
+        <div style={{ fontSize: 11, color: "#64748b", fontFamily: "monospace", marginBottom: 8, letterSpacing: "0.08em" }}>ANTHROPIC API KEY</div>
+        <div style={{ position: "relative", marginBottom: 12 }}>
+          <input type={show ? "text" : "password"} value={key} onChange={e => setKey(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && valid && onSave(key)}
+            placeholder="sk-ant-..."
+            style={{ width: "100%", background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "14px 48px 14px 16px", color: "#f1f5f9", fontSize: 14, fontFamily: "monospace" }} />
+          <button onClick={() => setShow(s => !s)} style={{ position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", color: "#475569", cursor: "pointer", fontSize: 16 }}>{show ? "🙈" : "👁"}</button>
+        </div>
+        <button onClick={() => valid && onSave(key)} disabled={!valid}
+          style={{ width: "100%", padding: 14, background: valid ? "linear-gradient(135deg,#e11d48,#9f1239)" : "#1e293b", border: "none", borderRadius: 12, color: valid ? "#fff" : "#475569", fontSize: 13, fontWeight: 700, fontFamily: "monospace", letterSpacing: "0.12em", textTransform: "uppercase", cursor: valid ? "pointer" : "not-allowed", boxShadow: valid ? "0 0 24px rgba(225,29,72,0.4)" : "none", transition: "all 0.2s" }}>
+          Get Started
+        </button>
+        <div style={{ marginTop: 18, padding: 14, background: "#0a0f1a", border: "1px solid #0f172a", borderRadius: 10, fontSize: 11, color: "#334155", fontFamily: "monospace", lineHeight: 1.7 }}>
+          Key stored locally on this device only. Never shared except with Anthropic's API directly.
+          Get a key at <span style={{ color: "#3b82f6" }}>console.anthropic.com</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function HeartScanner({ apiKey, onClearKey }) {
+  const [mode, setMode] = useState("search");
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(null);
+  const [photoData, setPhotoData] = useState(null);
+  const fileRef = useRef();
+
+  const handleScan = useCallback(async () => {
+    setError(null); setResult(null); setLoading(true);
+    try {
+      const res = mode === "photo"
+        ? await analyzeFood(photoData, "photo", apiKey)
+        : await analyzeFood(input.trim(), mode, apiKey);
+      setResult(res);
+    } catch(e) { setError(e.message || "Analysis failed. Try again."); }
+    finally { setLoading(false); }
+  }, [mode, input, photoData, apiKey]);
+
+  const handleFile = e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      setPhotoPreview(ev.target.result);
+      setPhotoData({ base64: ev.target.result.split(",")[1], mediaType: file.type });
+      setResult(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const canScan = !loading && (mode === "photo" ? !!photoData : !!input.trim());
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#030712", paddingBottom: 48 }}>
+      {/* Header */}
+      <div style={{ textAlign: "center", padding: "28px 20px 18px", borderBottom: "1px solid #0f172a" }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+          <span style={{ fontSize: 22, filter: "drop-shadow(0 0 8px #e11d48)" }}>♥</span>
+          <span style={{ fontSize: 22, fontWeight: 800, color: "#f1f5f9", letterSpacing: "-0.03em" }}>Heart<span style={{ color: "#e11d48" }}>Scan</span></span>
+        </div>
+        <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.14em", textTransform: "uppercase", fontFamily: "monospace" }}>Low HDL · Elevated LDL · Additive Safety</div>
+        <button onClick={onClearKey} style={{ marginTop: 6, background: "none", border: "none", color: "#1e293b", fontSize: 10, fontFamily: "monospace", cursor: "pointer", letterSpacing: "0.08em" }}>⚙ change api key</button>
+      </div>
+
+      <div style={{ maxWidth: 480, margin: "0 auto", padding: "20px 16px 0" }}>
+        {/* Mode tabs */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 18 }}>
+          {[["search","Search","⌕"],["upc","UPC","#"],["photo","Photo","⊡"]].map(([id, label, icon]) => (
+            <button key={id} className="mode-btn"
+              onClick={() => { setMode(id); setResult(null); setError(null); setInput(""); setPhotoPreview(null); setPhotoData(null); }}
+              style={{ padding: "10px 8px", borderRadius: 10, background: mode === id ? "#e11d48" : "#0f172a", border: `1px solid ${mode === id ? "#e11d48" : "#1e293b"}`, color: mode === id ? "#fff" : "#64748b", fontSize: 12, fontWeight: 700, fontFamily: "monospace", letterSpacing: "0.08em", textTransform: "uppercase", boxShadow: mode === id ? "0 0 16px rgba(225,29,72,0.35)" : "none" }}>
+              <span style={{ display: "block", fontSize: 18, marginBottom: 2 }}>{icon}</span>{label}
+            </button>
+          ))}
+        </div>
+
+        {/* Input */}
+        <div style={{ marginBottom: 14 }}>
+          {mode === "photo" ? (
+            <div>
+              <div className="drop-zone" onClick={() => fileRef.current?.click()}
+                style={{ border: "2px dashed #1e293b", borderRadius: 12, padding: "24px 16px", textAlign: "center", cursor: "pointer", background: "#0a0f1a", minHeight: photoPreview ? "auto" : 110 }}>
+                {photoPreview
+                  ? <img src={photoPreview} alt="Label" style={{ maxWidth: "100%", maxHeight: 200, borderRadius: 8, display: "block", margin: "0 auto" }} />
+                  : <><div style={{ fontSize: 28, marginBottom: 8, color: "#334155" }}>⊡</div><div style={{ fontSize: 13, color: "#475569" }}>Tap to upload nutrition label</div><div style={{ fontSize: 11, color: "#334155", marginTop: 4, fontFamily: "monospace" }}>JPG · PNG · WEBP</div></>
+                }
+              </div>
+              <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={handleFile} />
+              {photoPreview && <button className="mode-btn" onClick={() => { setPhotoPreview(null); setPhotoData(null); setResult(null); }} style={{ marginTop: 8, background: "none", color: "#475569", fontSize: 11, fontFamily: "monospace", letterSpacing: "0.1em" }}>✕ remove photo</button>}
+            </div>
+          ) : (
+            <input type={mode === "upc" ? "number" : "text"} value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && canScan && handleScan()}
+              placeholder={mode === "upc" ? "Enter UPC barcode number..." : "e.g. Quaker Old Fashioned Oats, Siggis Yogurt..."}
+              style={{ width: "100%", background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 12, padding: "14px 16px", color: "#f1f5f9", fontSize: 14, fontFamily: "monospace", transition: "border-color 0.2s" }} />
+          )}
+        </div>
+
+        {/* Scan button */}
+        <button className="scan-btn" onClick={handleScan} disabled={!canScan}
+          style={{ width: "100%", padding: 14, background: "linear-gradient(135deg,#e11d48,#9f1239)", border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, fontFamily: "monospace", letterSpacing: "0.12em", textTransform: "uppercase", boxShadow: loading ? "none" : "0 0 24px rgba(225,29,72,0.4)" }}>
+          {loading
+            ? <span style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+                <span style={{ width: 14, height: 14, border: "2px solid rgba(255,255,255,0.3)", borderTopColor: "#fff", borderRadius: "50%", display: "inline-block", animation: "spin 0.7s linear infinite" }} />
+                Analyzing...
+              </span>
+            : "Scan for Heart Health ♥"}
+        </button>
+
+        {error && <div style={{ marginTop: 14, background: "#1c0505", border: "1px solid #ef444433", borderRadius: 10, padding: "12px 16px", color: "#f87171", fontSize: 13, fontFamily: "monospace" }}>⚠ {error}</div>}
+        {result && <div style={{ marginTop: 18 }}><ResultCard result={result} apiKey={apiKey} /></div>}
+
+        {!result && !loading && (
+          <div style={{ marginTop: 20, padding: "14px 16px", background: "#0a0f1a", border: "1px solid #0f172a", borderRadius: 12 }}>
+            <div style={{ fontSize: 10, color: "#e11d48", letterSpacing: "0.14em", textTransform: "uppercase", fontFamily: "monospace", marginBottom: 10 }}>♥ Your Cardiac Profile</div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
+              {[["Avoid","Sat fat >3g"],["Avoid","Trans fats"],["Avoid","Coconut & palm oils"],["Avoid","Processed meats"],["Avoid","Refined carbs"],["Avoid","Added sugars >6g"],["Avoid","Harmful additives"],["Seek","Soluble fiber"],["Seek","Omega-3s"],["Seek","Olive/avocado oil"]].map(([t,item]) => (
+                <div key={item} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ color: t === "Avoid" ? "#ef4444" : "#22c55e", fontSize: 9 }}>●</span>
+                  <span style={{ fontSize: 11, color: "#475569", fontFamily: "monospace" }}>{item}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem(STORAGE_KEY) || '');
+  const save = key => { localStorage.setItem(STORAGE_KEY, key); setApiKey(key); };
+  const clear = () => { localStorage.removeItem(STORAGE_KEY); setApiKey(''); };
+  return apiKey ? <HeartScanner apiKey={apiKey} onClearKey={clear} /> : <ApiKeyScreen onSave={save} />;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
